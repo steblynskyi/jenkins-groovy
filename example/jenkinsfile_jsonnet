@@ -1,0 +1,59 @@
+@Library("steblynskyi-jenkins-dev") _
+
+node ('jsonnet-all') {
+
+    def dashboardsToPublish             = [
+										  [jsonnet : "dashboards/Export-Dashboard.jsonnet"],
+                                          [jsonnet : "dashboards/Reports-Dashboard.jsonnet"],
+                                          [jsonnet : "dashboards/InnSights-Dashboard.jsonnet"],
+                                          [jsonnet : "dashboards/ReservationSearch-Dashboard.jsonnet"],
+                                          [jsonnet : "dashboards/Security-Monitor-Dashboard.jsonnet"],
+                                          [jsonnet : "dashboards/Folio-Dashboard.jsonnet"],
+                                          [jsonnet : "dashboards/Dotnet-OpenTelemetry-Performance.jsonnet"],
+                                          [jsonnet : "dashboards/Dotnet-OpenTelemetry-Http.jsonnet"],
+                                          [jsonnet : "dashboards/Dotnet-OpenTelemetry-MassTransit.jsonnet"],
+                                          [jsonnet : "dashboards/Kafka-Dashboard.jsonnet"],
+                                          [jsonnet : "dashboards/Otas-Dashboard.jsonnet"],
+                                          [jsonnet : "dashboards/Messaging-Dashboard.jsonnet"],
+                                          [jsonnet : "dashboards/Inventory-Monitoring.jsonnet"],
+                                          [jsonnet : "dashboards/Integrations-EmailApi-Dashboard.jsonnet"],
+                                          [jsonnet : "dashboards/Business-Metrics-Dashboard.jsonnet"]
+                                          ]
+    def environmentSettings             =  getDeploymentEnvironmentSettings("${env.BRANCH_NAME}");
+
+    echo "Build for branch: '${env.BRANCH_NAME}'. Using environmentSettings: '${environmentSettings.DeploymentEnvironment}'"
+
+    def validBuildBranches = '.*(master|qa|develop).*'
+    def matched = (env.BRANCH_NAME ==~ validBuildBranches)
+
+    if(!matched) {
+        echo "Skip build for branch: '${env.BRANCH_NAME}'. Aborting Jenkins build with success."
+        echo "Builds will run for: master, qa, release, develop branches, and pull requests."
+        return
+    }
+
+    stage('Cleanup before build') {
+        cleanWs()
+    }
+
+    stage('Checkout') {
+        checkout scm
+        shortCommit = sh(returnStdout: true, script: 'git rev-parse --short HEAD').trim()
+    }
+
+    stage ('Publish Dashboard') {
+        if(environmentSettings.AutoDeploy){
+            dashboardsToPublish.each { a ->
+                withCredentials([string(credentialsId: "${environmentSettings.GrafanaCredentials}",variable: 'GRAFANA_TOKEN')]) {
+                    sh """
+                    chmod +x scripts/publish.sh
+                    bash scripts/publish.sh ${a.jsonnet} ${environmentSettings.GrafanaURL} $GRAFANA_TOKEN
+                    """
+                }
+            }
+        }else {
+            echo "Skip publishing dashboards for branch: '${env.BRANCH_NAME}'"
+        }
+
+    }
+}

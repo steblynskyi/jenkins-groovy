@@ -1,0 +1,109 @@
+@Library("steblynskyi-jenkins") _
+
+node ('dotnet-all') {
+
+    def forcePublish             = true
+    def assemblyVersion          = "1.0.0.${env.BUILD_NUMBER}"
+
+    def projectsToPublish        = ["src/Api/src",
+                                    "src/JobWorker/src",
+                                    "src/Persistence.Extensions.SqlServer.Migrator/src"] as String[]
+
+    def hotfixRegex              = "hotfix\\/.*"
+    def qaRegex                  = "qa\\d?"
+    def environmentSettings      = getDeploymentEnvironmentSettings("${env.BRANCH_NAME}");
+
+    def dockerPublishSettings    = [
+        [imageName: "pms-extensions-deferred-jobs-api"         , dockerFile: "src/Api/src/Dockerfile"],
+        [imageName: "pms-extensions-deferred-jobs-jobworker"   , dockerFile: "src/JobWorker/src/Dockerfile"],
+        [imageName: "pms-extensions-deferred-jobs-api-migrator", dockerFile: "src/Persistence.Extensions.SqlServer.Migrator/src/Dockerfile"]
+    ]
+
+    def dockerDeploymentSettings = [
+        [deploymentName: "extensions-deferred-jobs-api",
+        deploymentContext: "${environmentSettings.DeploymentContext}",
+        deploymentNamespace: "pms",
+        containerName: "extensions-deferred-jobs-api",
+        deploymentImageName: "pms-extensions-deferred-jobs-api"],
+
+        [deploymentName: "extensions-deferred-jobs-jobworker",
+        deploymentContext: "${environmentSettings.DeploymentContext}",
+        deploymentNamespace: "pms",
+        containerName: "extensions-deferred-jobs-jobworker",
+        deploymentImageName: "pms-extensions-deferred-jobs-jobworker"]
+    ]
+
+    def dockerDbDeploymentSettings = [
+        [deploymentName: 'extensions-deferred-jobs-api-migrator',
+        deploymentContext: "${environmentSettings.DeploymentContext}",
+        deploymentNamespace: 'pms',
+        containerName: 'extensions-deferred-jobs-api-migrator',
+        deploymentImageName: 'pms-extensions-deferred-jobs-api-migrator']
+    ]
+
+    def validBuildBranches       = '.*(master|qa\\d*|develop|PR-\\d*).*'
+    def matched                  = (env.BRANCH_NAME ==~ validBuildBranches)
+
+    if(!matched) {
+        echo "Skip build for branch: '${env.BRANCH_NAME}'. Aborting Jenkins build with success."
+        echo "Builds will run for: master, qa, release, development, develop branches, and pull requests."
+        return
+    }
+
+    stage ('Cleanup before build') {
+        cleanWs()
+    }
+
+    stage ('Checkout') {
+        checkout scm
+        shortCommit = sh(returnStdout: true, script: 'git rev-parse --short HEAD').trim()
+    }
+
+    stage ('Run Unit Tests and SonarCloud analysis') {
+        def projectKey = "steblynskyi_steblynskyi.deferred-jobs.api"
+        TestsAndSonarCloudAnalysisForNetCoreV2(projectKey, assemblyVersion, true, solutionRelativePath: "src/steblynskyi.DeferredJobs.Api.sln")
+    }
+
+    stage("SonarCloud Quality Gate") {
+        def invalidBuildBranches = '^(master|qa\\d*|develop)$'
+        SonarCloudQualityGate(invalidBuildBranches)
+    }
+
+    stage ('Restore & Build the Solutions') {
+        buildProjectsV2(projectsToPublish, assemblyVersion, environmentSettings.VersionSuffix)
+    }
+
+    stage ('Publish to Docker') {
+        echo "Starting Publish To Docker"
+        dockerPublishSettings.each {a ->
+            buildAndPushContainerImage(environmentSettings.AutoDeploy, a.imageName, shortCommit, a.dockerFile)
+        }
+    }
+
+    stage('Run DB Migrator') {
+        if (environmentSettings.AutoDeploy) {
+            withCredentials([usernamePassword(credentialsId: "${environmentSettings.QuartzDBCredentialId}", usernameVariable: 'USERNAME', passwordVariable: 'PASSWORD')]) {
+                echo 'Start Running DB Migrator'
+                def envVars = [
+                    ASPNETCORE_ENVIRONMENT: "${environmentSettings.DeploymentEnvironment}",
+                    MIGRATOR_ACTION:"up",
+                    ConnectionStringOverride__Username: "${env.USERNAME}",
+                    ConnectionStringOverride__Password: "${env.PASSWORD}",
+                    ConnectionStringOverride__Hostname: "${environmentSettings.QuartzDBHost}"
+                ]
+                dockerDbDeploymentSettings.each {a ->
+                    runKubeJob(a.deploymentName, a.deploymentImageName, a.deploymentContext, a.deploymentNamespace, shortCommit, envVars)
+                }
+            }
+        } else {
+            echo "Skip DB Migrator run for branch: '${env.BRANCH_NAME}'."
+        }
+    }
+
+    stage ('Deploy') {
+        echo "Starting Deploy To Docker"
+        dockerDeploymentSettings.each { a ->
+            deployDockerImageV2(environmentSettings.AutoDeploy, a.deploymentName, a.deploymentImageName, a.deploymentContext, a.deploymentNamespace, shortCommit, a.containerName)
+        }
+    }
+}
